@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openenv-logistics-crisis-manager"
+version = "0.1.0"
+description = "E-Commerce Logistics Crisis Manager environment for OpenEnv"
+requires-python = ">=3.10"
+dependencies = [
+    "openenv-core[core]>=0.2.2",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.24.0",
+    "pydantic>=2.0.0",
+    "networkx>=3.0",
+    "openai>=1.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[project.scripts]
+server = "logistics_crisis_manager.server.app:main"
+
+[tool.setuptools]
+include-package-data = true
+packages = [
+    "logistics_crisis_manager",
+    "logistics_crisis_manager.server",
+    "logistics_crisis_manager.client",
+]
+package-dir = {
+    "logistics_crisis_manager" = ".",
+    "logistics_crisis_manager.server" = "server",
+    "logistics_crisis_manager.client" = "client",
+}

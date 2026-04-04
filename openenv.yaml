@@ -1,0 +1,6 @@
+spec_version: 1
+name: logistics_crisis_manager
+type: space
+runtime: fastapi
+app: server.app:app
+port: 8000
