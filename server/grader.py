@@ -17,17 +17,28 @@ from typing import Any, Dict, List, Optional, Union
 
 from openenv.core.rubrics import Rubric
 
-from ..models import (
-    LogisticsCrisisManagerObservation,
-    MoveCargo,
-    RedeployStock,
-    Wait,
-)
+try:
+    from ..models import (
+        LogisticsCrisisManagerObservation,
+        MoveCargo,
+        RedeployStock,
+        Wait,
+    )
+except ImportError:  # standalone Docker layout: server/ is top-level
+    from models import (
+        LogisticsCrisisManagerObservation,
+        MoveCargo,
+        RedeployStock,
+        Wait,
+    )
 
 
 @dataclass
 class GraderStats:
     """Running statistics accumulated across the episode."""
+
+    # Per-step safety penalty for the *most recent* step (1.0 = clean)
+    last_step_safety: float = 1.0
 
     # Safety
     total_actions: int = 0
@@ -75,13 +86,32 @@ class LogisticsGrader(Rubric):
         self.w_e = weight_efficiency
         self.stats = GraderStats()
         self._action_log: List[Dict[str, Any]] = []
+        # ── per-task scoring config ──
+        self.task_id: str = "medium"
+        self.task_cfg: Dict[str, Any] = {}
+
+    # ── Per-task config ─────────────────────────────────────────────
+
+    def set_task(self, task_id: str, task_cfg: Dict[str, Any]) -> None:
+        """Bind the grader to a specific tiered task scenario."""
+        self.task_id = task_id
+        self.task_cfg = dict(task_cfg)
 
     # ── Rubric interface ────────────────────────────────────────────
 
     def forward(self, action: Any, observation: Any) -> float:
-        """Score a single step.  Returns the running verification score."""
+        """Score a single step.  Returns the running verification score.
+
+        Per-step safety: destructive actions (shipping to a blocked
+        node, malformed inputs, …) cause `record_*` to drop
+        `last_step_safety` *before* this method is called.
+        """
         self._record_action(action, observation)
         return self.verification_score()
+
+    def begin_step(self) -> None:
+        """Called by the environment at the start of every step."""
+        self.stats.last_step_safety = 1.0
 
     def reset(self) -> None:
         self.stats = GraderStats()
@@ -91,9 +121,13 @@ class LogisticsGrader(Rubric):
 
     def record_invalid_move(self) -> None:
         self.stats.invalid_moves += 1
+        # Soft per-step penalty (an honest mistake — not destructive).
+        self.stats.last_step_safety = min(self.stats.last_step_safety, 0.5)
 
     def record_blocked_node_attempt(self) -> None:
         self.stats.blocked_node_attempts += 1
+        # Hard per-step penalty: shipping to a blocked node is destructive.
+        self.stats.last_step_safety = 0.0
 
     def record_delivery(self, *, on_time: bool, destination: str) -> None:
         self.stats.deliveries_total += 1
@@ -170,12 +204,72 @@ class LogisticsGrader(Rubric):
             score *= 0.9
         return score
 
+    # ── Per-task scoring ───────────────────────────────────────────
+
+    def task_progress_score(self) -> float:
+        """Partial-credit progress toward the active task's goal.
+
+        Linearly rewards delivery progress up to `delivery_target` and
+        — for tasks with a stricter on-time bar — multiplies by the
+        ratio of achieved/required on-time rate (capped at 1.0).
+        """
+        st = self.stats
+        target = float(self.task_cfg.get("delivery_target") or 1)
+        delivered_credit = min(st.deliveries_total / target, 1.0)
+
+        # On-time gate
+        on_time_rate = (
+            st.deliveries_on_time / st.deliveries_total
+            if st.deliveries_total > 0
+            else 0.0
+        )
+        required = float(self.task_cfg.get("min_on_time_rate") or 0.0)
+        if required > 0:
+            on_time_ratio = min(on_time_rate / required, 1.0)
+        else:
+            on_time_ratio = 1.0
+
+        return round(delivered_credit * on_time_ratio, 4)
+
     def verification_score(self) -> float:
-        """Weighted combination — the final Programmatic Score."""
+        """Strict task-aware score in [0, 1].
+
+        Composition:
+            score = 0.20 * safety
+                  + 0.30 * reliability   (viral-trend handling, etc.)
+                  + 0.25 * efficiency    (on-time + budget)
+                  + 0.25 * task_progress (toward the tier's target)
+
+        For the **hard** task an additional reliability multiplier is
+        applied: failure to deliver into NY during the Viral Trend caps
+        the reliability sub-score at 0.4, which dominates the final
+        score.  This makes "Hard" genuinely difficult.
+        """
+        safety = self.safety_score()
+        reliability = self.reliability_score()
+        efficiency = self.efficiency_score()
+        progress = self.task_progress_score()
+
+        # Hard-task strictness: severely penalise unhandled viral trend.
+        if self.task_id == "hard" and self.stats.viral_trend_active:
+            if self.stats.ny_deliveries_during_trend == 0:
+                reliability = min(reliability, 0.2)
+                progress *= 0.5
+
+        # Medium-task strictness: missing the 80% on-time bar caps
+        # progress.
+        if self.task_id == "medium" and self.stats.deliveries_total > 0:
+            on_time_rate = (
+                self.stats.deliveries_on_time / self.stats.deliveries_total
+            )
+            if on_time_rate < float(self.task_cfg.get("min_on_time_rate", 0.8)):
+                progress *= 0.6
+
         score = (
-            self.w_s * self.safety_score()
-            + self.w_r * self.reliability_score()
-            + self.w_e * self.efficiency_score()
+            0.20 * safety
+            + 0.30 * reliability
+            + 0.25 * efficiency
+            + 0.25 * progress
         )
         return round(max(min(score, 1.0), 0.0), 4)
 
@@ -184,9 +278,11 @@ class LogisticsGrader(Rubric):
     def report(self) -> Dict[str, Any]:
         """Return a human-readable grading report dict."""
         return {
+            "task_id": self.task_id,
             "safety": round(self.safety_score(), 4),
             "reliability": round(self.reliability_score(), 4),
             "efficiency": round(self.efficiency_score(), 4),
+            "task_progress": self.task_progress_score(),
             "verification_score": self.verification_score(),
             "stats": {
                 "total_actions": self.stats.total_actions,

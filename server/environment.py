@@ -16,17 +16,30 @@ from uuid import uuid4
 import networkx as nx
 from openenv.core.env_server.interfaces import Environment
 
-from ..models import (
-    CarrierType,
-    Edge,
-    LogisticsCrisisManagerObservation,
-    LogisticsCrisisManagerState,
-    MoveCargo,
-    Node,
-    RedeployStock,
-    Wait,
-)
-from .grader import LogisticsGrader
+try:
+    from ..models import (
+        CarrierType,
+        Edge,
+        LogisticsCrisisManagerObservation,
+        LogisticsCrisisManagerState,
+        MoveCargo,
+        Node,
+        RedeployStock,
+        Wait,
+    )
+    from .grader import LogisticsGrader
+except ImportError:  # standalone Docker layout: server/ is top-level
+    from models import (
+        CarrierType,
+        Edge,
+        LogisticsCrisisManagerObservation,
+        LogisticsCrisisManagerState,
+        MoveCargo,
+        Node,
+        RedeployStock,
+        Wait,
+    )
+    from server.grader import LogisticsGrader
 
 # ── Constants ───────────────────────────────────────────────────────
 
@@ -84,9 +97,57 @@ FRUGALITY_THRESHOLD = 0.70   # +0.5 bonus if <70 % budget used
 
 PORT_STRIKE_STEP = 5        # LA port strike
 VIRAL_TREND_STEP = 15       # NY demand surge
+FUEL_SURGE_STEP = 10        # global fuel cost spike (Hard task)
 DEMAND_SPIKE_MULT = 5
 FUEL_SURGE_MULT = 3         # shipping costs tripled
 CYBER_ATTACK_DURATION = 3   # steps with hidden inventory
+
+
+# ── Tiered task configurations ─────────────────────────────────────
+#
+# Each task is a deterministic scenario.  The reset() method takes a
+# `task_id` argument selecting one of these:
+#
+#   - "easy"   : Routine logistics. No black-swan events. Goal: deliver
+#                50 units within budget.
+#   - "medium" : Coastal Blockade. LA Port Strike fires at step 5. Goal:
+#                maintain on-time rate > 80% by re-routing via Rail/Air.
+#   - "hard"   : Global Collapse. Port Strike (5) + Fuel Surge (10) +
+#                Viral Trend (15). Goal: survive extreme demand spikes
+#                while costs triple.
+TASK_CONFIGS: Dict[str, Dict[str, Any]] = {
+    "easy": {
+        "description": "Routine logistics — deliver 50 units within budget.",
+        "port_strike": False,
+        "fuel_surge": False,
+        "viral_trend": False,
+        "cyber_attack": False,
+        "demand_per_tick": 5,
+        "delivery_target": 50,
+        "min_on_time_rate": 0.0,
+    },
+    "medium": {
+        "description": "Coastal Blockade — survive LA Port Strike with on-time > 80%.",
+        "port_strike": True,
+        "fuel_surge": False,
+        "viral_trend": False,
+        "cyber_attack": False,
+        "demand_per_tick": 10,
+        "delivery_target": 30,
+        "min_on_time_rate": 0.8,
+    },
+    "hard": {
+        "description": "Global Collapse — Port Strike + Fuel Surge + Viral Trend.",
+        "port_strike": True,
+        "fuel_surge": True,
+        "viral_trend": True,
+        "cyber_attack": False,
+        "demand_per_tick": 10,
+        "delivery_target": 40,
+        "min_on_time_rate": 0.7,
+    },
+}
+DEFAULT_TASK_ID = "medium"
 
 
 # ── In-flight shipment tracker ──────────────────────────────────────
@@ -182,6 +243,9 @@ class LogisticsEnv(
         self._cyber_attack_remaining: int = 0
         self._fuel_surge_step: int = 0
         self._cyber_attack_step: int = 0
+        # ── tiered task config ──
+        self.task_id: str = DEFAULT_TASK_ID
+        self._task_cfg: Dict[str, Any] = TASK_CONFIGS[DEFAULT_TASK_ID]
         # ── reward bookkeeping ──
         self._deliveries_total: int = 0
         self._deliveries_on_time: int = 0
@@ -197,12 +261,32 @@ class LogisticsEnv(
         self,
         seed: Optional[int] = None,
         episode_id: Optional[str] = None,
+        task_id: Optional[str] = None,
         **kwargs: Any,
     ) -> LogisticsCrisisManagerObservation:
-        self._reset_rubric()
-        self._rng = random.Random(seed)
+        """Reset the environment.
 
-        eid = episode_id or str(uuid4())
+        Args:
+            seed: optional RNG seed (only used for tie-breaking — task
+                scenarios are fully deterministic per `task_id`).
+            episode_id: optional caller-supplied episode identifier.
+            task_id: one of "easy", "medium", "hard" — selects the
+                tiered scenario.  Defaults to "medium" if omitted.
+        """
+        self._reset_rubric()
+        self._rng = random.Random(seed if seed is not None else 0)
+
+        # ── select tiered task ────────────────────────────────────────
+        chosen = (task_id or kwargs.get("task") or DEFAULT_TASK_ID).lower()
+        if chosen not in TASK_CONFIGS:
+            raise ValueError(
+                f"Unknown task_id '{chosen}'. Valid: {list(TASK_CONFIGS)}"
+            )
+        self.task_id = chosen
+        self._task_cfg = TASK_CONFIGS[chosen]
+        self.grader.set_task(chosen, self._task_cfg)
+
+        eid = episode_id or f"{chosen}-{uuid4().hex[:8]}"
 
         # Build nodes
         nodes: Dict[str, Node] = {}
@@ -232,7 +316,10 @@ class LogisticsEnv(
             inventory=inventory,
             current_time=0,
             budget=STARTING_BUDGET,
-            news_feed=["Hour 0: Simulation started. All routes operational."],
+            news_feed=[
+                f"Hour 0: Simulation started ({chosen.upper()} task — "
+                f"{self._task_cfg['description']}). All routes operational."
+            ],
         )
         self._shipments = []
         self._graph = _build_networkx_graph(edges)
@@ -245,9 +332,11 @@ class LogisticsEnv(
         self._demand_multiplier = 1
         self._cyber_attack_remaining = 0
 
-        # Pre-roll random event steps (between step 8-25 for fuel, 10-30 for cyber)
-        self._fuel_surge_step = self._rng.randint(8, 25)
-        self._cyber_attack_step = self._rng.randint(10, 30)
+        # Deterministic event steps for the chosen task.  We still
+        # initialise these even when an event is disabled — they will
+        # simply never trigger because the task config gates them.
+        self._fuel_surge_step = FUEL_SURGE_STEP
+        self._cyber_attack_step = 10**9  # disabled by default in tiered tasks
 
         # ── reset reward bookkeeping ──
         self._deliveries_total = 0
@@ -274,6 +363,7 @@ class LogisticsEnv(
     ) -> LogisticsCrisisManagerObservation:
         s = self._state
         s.step_count += 1
+        self.grader.begin_step()
 
         # --- execute the action ---
         if isinstance(action, MoveCargo):
@@ -316,11 +406,16 @@ class LogisticsEnv(
     # ── black-swan events ─────────────────────────────────────────
 
     def _trigger_events(self) -> None:
-        """Fire black-swan events at predetermined or random steps."""
+        """Fire black-swan events at predetermined steps for this task."""
         s = self._state
+        cfg = self._task_cfg
 
         # ── Step 5: LA Port Strike ──────────────────────────────────
-        if s.step_count >= PORT_STRIKE_STEP and not self._port_strike_triggered:
+        if (
+            cfg.get("port_strike")
+            and s.step_count >= PORT_STRIKE_STEP
+            and not self._port_strike_triggered
+        ):
             self._port_strike_triggered = True
             affected = 0
             for eid, edge in s.edges.items():
@@ -339,7 +434,11 @@ class LogisticsEnv(
             )
 
         # ── Step 15: NY Viral Trend ─────────────────────────────────
-        if s.step_count >= VIRAL_TREND_STEP and not self._viral_trend_triggered:
+        if (
+            cfg.get("viral_trend")
+            and s.step_count >= VIRAL_TREND_STEP
+            and not self._viral_trend_triggered
+        ):
             self._viral_trend_triggered = True
             self._demand_multiplier = DEMAND_SPIKE_MULT
             self.grader.activate_viral_trend()
@@ -349,8 +448,12 @@ class LogisticsEnv(
                 f"Inventory will deplete rapidly."
             )
 
-        # ── Random: Fuel Surge ──────────────────────────────────────
-        if s.step_count >= self._fuel_surge_step and not self._fuel_surge_triggered:
+        # ── Step 10: Global Fuel Surge ──────────────────────────────
+        if (
+            cfg.get("fuel_surge")
+            and s.step_count >= self._fuel_surge_step
+            and not self._fuel_surge_triggered
+        ):
             self._fuel_surge_triggered = True
             for edge in s.edges.values():
                 edge.cost_per_unit = round(edge.cost_per_unit * FUEL_SURGE_MULT, 2)
@@ -361,7 +464,11 @@ class LogisticsEnv(
             )
 
         # ── Random: Cyber Attack ────────────────────────────────────
-        if s.step_count >= self._cyber_attack_step and not self._cyber_attack_triggered:
+        if (
+            cfg.get("cyber_attack")
+            and s.step_count >= self._cyber_attack_step
+            and not self._cyber_attack_triggered
+        ):
             self._cyber_attack_triggered = True
             self._cyber_attack_remaining = CYBER_ATTACK_DURATION
             s.news_feed.append(
@@ -373,7 +480,7 @@ class LogisticsEnv(
     def _apply_demand_drain(self) -> None:
         """Simulate consumer demand consuming inventory at high-demand hubs."""
         s = self._state
-        base_drain_per_tick = 10
+        base_drain_per_tick = int(self._task_cfg.get("demand_per_tick", 10))
 
         for city, node in s.nodes.items():
             if getattr(node, "role", None) != "High-Demand Hub":
@@ -718,10 +825,34 @@ class LogisticsEnv(
             )
         ]
 
+        # ── info dict (OpenEnv carries `info` via Observation.metadata) ──
+        info: Dict[str, Any] = {
+            "task_id": self.task_id,
+            "step_count": s.step_count,
+            "current_time": s.current_time,
+            "budget_remaining": round(s.budget, 2),
+            "total_spent": round(self._total_spent, 2),
+            "deliveries_total": self._deliveries_total,
+            "deliveries_on_time": self._deliveries_on_time,
+            "on_time_rate": (
+                self._deliveries_on_time / self._deliveries_total
+                if self._deliveries_total > 0
+                else None
+            ),
+            "in_transit": len(self._shipments),
+            "events": {
+                "port_strike": self._port_strike_triggered,
+                "viral_trend": self._viral_trend_triggered,
+                "fuel_surge": self._fuel_surge_triggered,
+                "cyber_attack": self._cyber_attack_triggered,
+            },
+        }
+
         return LogisticsCrisisManagerObservation(
             summary="\n".join(summary_parts),
             active_delays=active_delays,
             active_crises=active_crises,
             done=done,
             reward=reward,
+            metadata=info,
         )

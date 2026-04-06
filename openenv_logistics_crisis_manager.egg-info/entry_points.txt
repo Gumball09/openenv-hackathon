@@ -1,0 +1,2 @@
+[console_scripts]
+server = logistics_crisis_manager.server.app:main

@@ -48,17 +48,23 @@ app = create_app(
 )
 
 
-def main(host: str = "0.0.0.0", port: int = 8000):
-    """Entry point for direct execution."""
+def main():
+    """Entry point for direct execution.
+
+    Honours ``--host`` / ``--port`` CLI flags as well as the
+    ``LCM_HOST`` / ``LCM_PORT`` environment variables.
+    """
+    import argparse
+    import os
+
     import uvicorn
 
-    uvicorn.run(app, host=host, port=port)
+    parser = argparse.ArgumentParser(description="Run Logistics Crisis Manager server")
+    parser.add_argument("--host", type=str, default=os.environ.get("LCM_HOST", "0.0.0.0"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("LCM_PORT", "8000")))
+    args = parser.parse_args()
+    uvicorn.run(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=8000)
-    args = parser.parse_args()
-    main(port=args.port)
+    main()

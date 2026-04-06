@@ -1,6 +1,47 @@
 spec_version: 1
 name: logistics_crisis_manager
+version: "0.1.0"
 type: space
 runtime: fastapi
 app: server.app:app
 port: 8000
+
+description: >
+  E-Commerce Logistics Crisis Manager — a 5-node global supply-chain
+  simulator (NetworkX DiGraph) where an LLM agent must move cargo,
+  redeploy stock, and react to Black-Swan events (port strikes, viral
+  demand spikes, fuel surges).  Ships with three deterministic tiered
+  tasks (easy / medium / hard) and a programmatic grader scoring in
+  [0, 1].
+
+author: openenv-hackathon
+license: BSD-3-Clause
+tags:
+  - logistics
+  - supply-chain
+  - reasoning
+  - tool-use
+  - multi-step
+
+tasks:
+  - id: easy
+    description: Routine logistics — deliver 50 units within budget. No disruptions.
+  - id: medium
+    description: Coastal Blockade — LA Port Strike at step 5. Maintain on-time > 80%.
+  - id: hard
+    description: Global Collapse — Port Strike (5) + Fuel Surge (10) + NY Viral Trend (15).
+
+action_space:
+  - move_cargo
+  - redeploy_stock
+  - wait
+
+observation:
+  type: text
+  fields:
+    - summary
+    - active_crises
+    - active_delays
+    - reward
+    - done
+    - metadata
