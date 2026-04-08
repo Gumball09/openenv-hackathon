@@ -1,8 +1,12 @@
 README.md
+__init__.py
+models.py
 pyproject.toml
 ./__init__.py
+./inference.py
 ./models.py
 client/__init__.py
+client/dashboard.py
 client/inference.py
 openenv_logistics_crisis_manager.egg-info/PKG-INFO
 openenv_logistics_crisis_manager.egg-info/SOURCES.txt

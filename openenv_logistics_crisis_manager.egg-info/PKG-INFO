@@ -13,3 +13,6 @@ Requires-Dist: python-dotenv>=1.0.0
 Provides-Extra: dev
 Requires-Dist: pytest>=8.0.0; extra == "dev"
 Requires-Dist: pytest-cov>=4.0.0; extra == "dev"
+Provides-Extra: dashboard
+Requires-Dist: streamlit>=1.30.0; extra == "dashboard"
+Requires-Dist: pandas>=2.0.0; extra == "dashboard"

@@ -6,6 +6,11 @@ runtime: fastapi
 app: server.app:app
 port: 8000
 
+repo_id: Gumball0902/openenv-hackathon
+github_url: https://github.com/Gumball09/openenv-hackathon
+hf_space_url: https://huggingface.co/spaces/Gumball0902/openenv-hackathon
+entrypoint: client.py
+
 description: >
   E-Commerce Logistics Crisis Manager — a 5-node global supply-chain
   simulator (NetworkX DiGraph) where an LLM agent must move cargo,
