@@ -24,7 +24,7 @@ import json
 import os
 import sys
 import time
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 # Make `logistics_crisis_manager` importable when running this file
 # directly from the project root (e.g. `python inference.py`).
@@ -63,6 +63,9 @@ MAX_STEPS_PER_TASK = int(os.environ.get("MAX_STEPS_PER_TASK", "20"))
 TEMPERATURE = float(os.environ.get("TEMPERATURE", "0.2"))
 MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "350"))
 
+BENCHMARK = os.environ.get("LCM_BENCHMARK", "logistics_crisis_manager")
+SUCCESS_SCORE_THRESHOLD = float(os.environ.get("LCM_SUCCESS_THRESHOLD", "0.5"))
+
 SYSTEM_PROMPT = """\
 You are a Global Supply-Chain Crisis Manager controlling a 5-node
 logistics network (Shanghai, Rotterdam, London, Los Angeles, New York).
@@ -88,16 +91,56 @@ Always read the News Feed.  Pre-position stock before crises hit.
 
 
 # ── Structured logging helpers ──────────────────────────────────────
+#
+# The hackathon evaluator parses three line types in this exact format:
+#
+#   [START] task=<task_name> env=<benchmark> model=<model_name>
+#   [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
+#   [END]   success=<true|false> steps=<n> score=<score> rewards=<r1,r2,...,rn>
+#
+# Rules: reward/score formatted to 2 decimal places, booleans lowercase,
+# error is the raw message or the literal "null", every record on a
+# single line with no embedded newlines.
 
 
-def _emit(tag: str, payload: Dict[str, Any]) -> None:
-    """Emit a single structured stdout line: ``[TAG] {json}``.
+def _sanitize(value: str) -> str:
+    """Collapse whitespace and strip newlines so a field stays single-line."""
+    if value is None:
+        return "null"
+    return " ".join(str(value).split())
 
-    The hackathon evaluator scrapes lines starting with ``[START]``,
-    ``[STEP]``, and ``[END]`` and parses the trailing JSON object.
-    Field names and ordering are stable across runs.
-    """
-    sys.stdout.write(f"[{tag}] {json.dumps(payload, separators=(',', ':'), default=str)}\n")
+
+def log_start(task: str, env: str, model: str) -> None:
+    sys.stdout.write(f"[START] task={task} env={env} model={model}\n")
+    sys.stdout.flush()
+
+
+def log_step(
+    step: int,
+    action: str,
+    reward: float,
+    done: bool,
+    error: Optional[str],
+) -> None:
+    err = _sanitize(error) if error else "null"
+    sys.stdout.write(
+        f"[STEP] step={step} action={_sanitize(action)} "
+        f"reward={reward:.2f} done={str(bool(done)).lower()} error={err}\n"
+    )
+    sys.stdout.flush()
+
+
+def log_end(
+    success: bool,
+    steps: int,
+    score: float,
+    rewards: List[float],
+) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    sys.stdout.write(
+        f"[END] success={str(bool(success)).lower()} steps={steps} "
+        f"score={score:.2f} rewards={rewards_str}\n"
+    )
     sys.stdout.flush()
 
 
@@ -155,96 +198,103 @@ def _obs_to_user_message(obs: LogisticsCrisisManagerObservation) -> Dict[str, st
 
 def run_task(client: OpenAI, task_id: str) -> Dict[str, Any]:
     env = LogisticsEnv()
-    obs = env.reset(task_id=task_id, seed=0)
     cfg = TASK_CONFIGS[task_id]
 
-    _emit(
-        "START",
-        {
-            "task_id": task_id,
-            "model": MODEL_NAME,
-            "api_base_url": API_BASE_URL,
-            "max_steps": MAX_STEPS_PER_TASK,
-            "delivery_target": cfg["delivery_target"],
-            "min_on_time_rate": cfg["min_on_time_rate"],
-            "description": cfg["description"],
-        },
-    )
+    rewards: List[float] = []
+    steps_taken = 0
+    score = 0.0
+    success = False
+    last_error: Optional[str] = None
 
-    messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                f"=== TASK: {task_id.upper()} ===\n"
-                f"{cfg['description']}\n"
-                f"Delivery target: {cfg['delivery_target']} units. "
-                f"Min on-time rate: {cfg['min_on_time_rate']:.0%}.\n"
-            ),
-        },
-        _obs_to_user_message(obs),
-    ]
+    log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
 
-    consecutive_failures = 0
-    last_error: str = ""
-    for step in range(1, MAX_STEPS_PER_TASK + 1):
-        if obs.done:
-            break
+    try:
+        obs = env.reset(task_id=task_id, seed=0)
 
-        try:
-            completion = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=messages,
-                temperature=TEMPERATURE,
-                max_tokens=MAX_OUTPUT_TOKENS,
-            )
-            content = completion.choices[0].message.content or ""
-            consecutive_failures = 0
-        except Exception as exc:
-            consecutive_failures += 1
-            last_error = str(exc)
-            sys.stderr.write(f"LLM call failed at step {step}: {exc}\n")
-            if consecutive_failures >= 3:
-                break
-            content = '{"type":"wait","hours":4,"rationale":"LLM call failed"}'
-
-        action = _parse_action(content, step)
-        messages.append({"role": "assistant", "content": content})
-
-        obs = env.step(action)
-        messages.append(_obs_to_user_message(obs))
-
-        _emit(
-            "STEP",
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": SYSTEM_PROMPT},
             {
-                "task_id": task_id,
-                "step": step,
-                "action_type": action.type,
-                "action": json.loads(action.model_dump_json(exclude={"metadata"})),
-                "reward": obs.reward,
-                "done": obs.done,
-                "info": obs.metadata or {},
+                "role": "user",
+                "content": (
+                    f"=== TASK: {task_id.upper()} ===\n"
+                    f"{cfg['description']}\n"
+                    f"Delivery target: {cfg['delivery_target']} units. "
+                    f"Min on-time rate: {cfg['min_on_time_rate']:.0%}.\n"
+                ),
             },
-        )
+            _obs_to_user_message(obs),
+        ]
 
-    report = env.grader.report()
-    end_payload = {
+        consecutive_failures = 0
+        for step in range(1, MAX_STEPS_PER_TASK + 1):
+            if obs.done:
+                break
+
+            step_error: Optional[str] = None
+            try:
+                completion = client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=messages,
+                    temperature=TEMPERATURE,
+                    max_tokens=MAX_OUTPUT_TOKENS,
+                )
+                content = completion.choices[0].message.content or ""
+                consecutive_failures = 0
+            except Exception as exc:
+                consecutive_failures += 1
+                last_error = str(exc)
+                step_error = str(exc)
+                sys.stderr.write(f"LLM call failed at step {step}: {exc}\n")
+                if consecutive_failures >= 3:
+                    log_step(
+                        step=step,
+                        action="noop",
+                        reward=0.0,
+                        done=True,
+                        error=step_error,
+                    )
+                    rewards.append(0.0)
+                    steps_taken = step
+                    break
+                content = '{"type":"wait","hours":4,"rationale":"LLM call failed"}'
+
+            action = _parse_action(content, step)
+            messages.append({"role": "assistant", "content": content})
+
+            obs = env.step(action)
+            messages.append(_obs_to_user_message(obs))
+
+            reward = float(obs.reward or 0.0)
+            rewards.append(reward)
+            steps_taken = step
+
+            action_str = action.model_dump_json(exclude={"metadata"})
+            log_step(
+                step=step,
+                action=action_str,
+                reward=reward,
+                done=bool(obs.done),
+                error=step_error,
+            )
+
+        report = env.grader.report()
+        score = float(report["verification_score"])
+        score = max(0.0, min(1.0, score))
+        success = score >= SUCCESS_SCORE_THRESHOLD
+    except Exception as exc:
+        last_error = str(exc)
+        sys.stderr.write(f"Task {task_id} crashed: {exc}\n")
+    finally:
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+
+    return {
         "task_id": task_id,
-        "score": report["verification_score"],
-        "safety": report["safety"],
-        "reliability": report["reliability"],
-        "efficiency": report["efficiency"],
-        "task_progress": report["task_progress"],
-        "deliveries_total": env._deliveries_total,
-        "deliveries_on_time": env._deliveries_on_time,
-        "budget_remaining": round(env.state.budget, 2),
-        "steps_taken": env.state.step_count,
+        "score": score,
+        "success": success,
+        "steps": steps_taken,
+        "rewards": rewards,
+        "error": last_error,
     }
-    if last_error and consecutive_failures >= 3:
-        end_payload["aborted"] = True
-        end_payload["error"] = last_error
-    _emit("END", end_payload)
-    return end_payload
 
 
 # ── Entry point ─────────────────────────────────────────────────────
@@ -260,27 +310,11 @@ def main() -> int:
     client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
 
     started_at = time.time()
-    results: List[Dict[str, Any]] = []
     for task_id in TASK_CONFIGS:
-        try:
-            results.append(run_task(client, task_id))
-        except Exception as exc:  # pragma: no cover - defensive
-            sys.stderr.write(f"Task {task_id} crashed: {exc}\n")
-            _emit("END", {"task_id": task_id, "score": 0.0, "error": str(exc)})
+        run_task(client, task_id)
 
-    avg = (
-        sum(r.get("score", 0.0) for r in results) / len(results)
-        if results
-        else 0.0
-    )
-    _emit(
-        "SUMMARY",
-        {
-            "tasks": [r["task_id"] for r in results],
-            "scores": {r["task_id"]: r.get("score", 0.0) for r in results},
-            "average_score": round(avg, 4),
-            "elapsed_seconds": round(time.time() - started_at, 2),
-        },
+    sys.stderr.write(
+        f"All tasks finished in {time.time() - started_at:.2f}s\n"
     )
     return 0
 
